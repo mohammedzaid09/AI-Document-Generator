@@ -1,12 +1,15 @@
 
-
 from app.services.code_scanner import CodeScanner
 from app.services.code_parser import PythonCodeParser
 from app.services.code_sync_service import CodeSyncService
+from app.services.code_persistence_service import CodePersistenceService
+from app.services.code_import_resolution_service import (
+    CodeImportResolutionService,
+)
 
 
 class CodeAnalysisService:
-    """Analyze new, changed, or all Python files in a GitHub repository."""
+    """Analyze, persist, and resolve Python files in a GitHub repository."""
 
     def __init__(self, github, db):
         self.github = github
@@ -46,10 +49,11 @@ class CodeAnalysisService:
             source_files=python_files,
         )
 
-        if force_reanalysis:
-            files_to_fetch = python_files
-        else:
-            files_to_fetch = sync["new"] + sync["changed"]
+        files_to_fetch = (
+            python_files
+            if force_reanalysis
+            else sync["new"] + sync["changed"]
+        )
 
         analyzed_files = []
         retrieval_failures = []
@@ -64,7 +68,6 @@ class CodeAnalysisService:
                     path=path,
                     ref=branch,
                 )
-
                 parsed = PythonCodeParser.parse(file["content"])
 
                 analyzed_files.append({
@@ -84,7 +87,7 @@ class CodeAnalysisService:
                     "reason": str(exc),
                 })
 
-        return {
+        analysis_result = {
             "repository": f"{owner}/{repo}",
             "repository_id": repository_id,
             "branch": branch,
@@ -103,3 +106,17 @@ class CodeAnalysisService:
             "python_files_failed": retrieval_failures,
             "files": analyzed_files,
         }
+
+        persistence_result = CodePersistenceService(self.db).save_analysis(
+            repository_id=repository_id,
+            analysis_result=analysis_result,
+        )
+
+        resolution_result = CodeImportResolutionService(
+            self.db
+        ).resolve_repository(repository_id)
+
+        analysis_result["persistence"] = persistence_result
+        analysis_result["import_resolution"] = resolution_result
+
+        return analysis_result

@@ -1,6 +1,9 @@
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
+from fastapi import HTTPException
 
+from app.services.code_analysis_service import CodeAnalysisService
+from app.services.github_service import GitHubService
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
@@ -87,3 +90,47 @@ def delete_repository(
         repository_id=repository_id,
         owner_id=current_user.id,
     )
+
+@router.post("/repositories/{repository_id}/analyze")
+def analyze_repository(
+    repository_id: int,
+    force_reanalysis: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    repository_service = RepositoryService(db)
+
+    repository = repository_service.get_repository(
+        repository_id=repository_id,
+        owner_id=current_user.id,
+    )
+
+    try:
+        github = GitHubService(
+            db=db,
+            user_id=current_user.id,
+        )
+
+        owner, repo = repository.full_name.split("/", 1)
+
+        service = CodeAnalysisService(github=github, db=db)
+
+        return service.analyze_repository(
+            owner=owner,
+            repo=repo,
+            repository_id=repository.id,
+            branch=repository.default_branch,
+            force_reanalysis=force_reanalysis,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc

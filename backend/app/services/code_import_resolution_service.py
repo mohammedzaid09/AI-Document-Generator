@@ -1,4 +1,8 @@
-﻿from pathlib import PurePosixPath
+﻿
+import re
+import sys
+from importlib.metadata import packages_distributions
+from pathlib import Path, PurePosixPath
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -7,7 +11,7 @@ from app.models.code_file import CodeFile
 
 
 class CodeImportResolutionService:
-    """Resolve Python imports to files in the same repository."""
+    """Resolve and classify Python imports."""
 
     def __init__(self, db: Session):
         self.db = db
@@ -32,16 +36,15 @@ class CodeImportResolutionService:
         if relative_level < 1:
             return module or None
 
-        source = PurePosixPath(source_path)
-        package_parts = list(source.parent.parts)
-
-        # One dot means the current package; two dots move up one package.
+        package_parts = list(PurePosixPath(source_path).parent.parts)
         climb = relative_level - 1
+
         if climb:
-            if climb >= len(package_parts):
-                package_parts = []
-            else:
-                package_parts = package_parts[:-climb]
+            package_parts = (
+                package_parts[:-climb]
+                if climb < len(package_parts)
+                else []
+            )
 
         module_parts = module.split(".") if module else []
         parts = package_parts + module_parts
@@ -53,6 +56,98 @@ class CodeImportResolutionService:
         if paths and all(path.startswith("backend/") for path in paths):
             return "backend/"
         return ""
+
+    @staticmethod
+    def _normalize_distribution(name: str) -> str:
+        """Normalize package names for comparisons."""
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    @classmethod
+    def _load_declared_distributions(cls) -> set[str]:
+        """Read declared dependencies from requirements.txt."""
+        requirements_path = (
+            Path(__file__).resolve().parents[2] / "requirements.txt"
+        )
+        declared = set()
+
+        if not requirements_path.exists():
+            return declared
+
+        try:
+            requirements_text = requirements_path.read_text(
+                encoding="utf-16"
+            )
+        except UnicodeError:
+            requirements_text = requirements_path.read_text(
+                encoding="utf-8-sig",
+                errors="replace",
+            )
+
+        for line in requirements_text.splitlines():
+            line = line.strip()
+
+            if not line or line.startswith("#") or line.startswith(("-", ".")):
+                continue
+
+            match = re.match(r"([A-Za-z0-9_.-]+)", line)
+            if match:
+                declared.add(
+                    cls._normalize_distribution(match.group(1))
+                )
+
+        return declared
+
+    @classmethod
+    def _classify_import(
+        cls,
+        module: str,
+        relative_level: int,
+        target: CodeFile | None,
+        module_distributions: dict[str, list[str]],
+        declared_distributions: set[str],
+    ) -> str:
+        """Classify an import without guessing that every unknown is external."""
+        if target is not None:
+            return "internal"
+
+        if relative_level > 0 or not module:
+            return "unknown"
+
+        root_module = module.split(".", 1)[0]
+
+        if root_module in sys.stdlib_module_names:
+            return "stdlib"
+
+        # Directly match import names to declared dependency names.
+        if (
+            cls._normalize_distribution(root_module)
+            in declared_distributions
+        ):
+            return "third_party"
+
+        distributions = module_distributions.get(root_module, [])
+        for distribution in distributions:
+            if (
+                cls._normalize_distribution(distribution)
+                in declared_distributions
+            ):
+                return "third_party"
+
+        # Handle common import names that differ from distribution names.
+        aliases = {
+            "dotenv": "python-dotenv",
+            "jwt": "pyjwt",
+            "yaml": "pyyaml",
+            "PIL": "pillow",
+            "cv2": "opencv-python",
+            "dateutil": "python-dateutil",
+        }
+
+        alias = aliases.get(root_module)
+        if alias and cls._normalize_distribution(alias) in declared_distributions:
+            return "third_party"
+
+        return "unknown"
 
     def resolve_repository(self, repository_id: int) -> dict:
         files = list(
@@ -72,8 +167,15 @@ class CodeImportResolutionService:
             return path
 
         path_to_file = {normalize(item.path): item for item in files}
-        resolved = 0
-        unresolved = 0
+        module_distributions = packages_distributions()
+        declared_distributions = self._load_declared_distributions()
+
+        counts = {
+            "internal": 0,
+            "stdlib": 0,
+            "third_party": 0,
+            "unknown": 0,
+        }
         unresolved_details = []
 
         for source_file in files:
@@ -90,16 +192,14 @@ class CodeImportResolutionService:
 
                 candidates = []
 
-                # For "from package import submodule", try the submodule
-                # before falling back to the package itself.
                 if import_item.import_kind == "from_import":
                     for name in import_item.imported_names or []:
-                        if module:
-                            candidates.extend(
-                                self._module_candidates(f"{module}.{name}")
-                            )
-                        else:
-                            candidates.extend(self._module_candidates(name))
+                        candidate_module = (
+                            f"{module}.{name}" if module else name
+                        )
+                        candidates.extend(
+                            self._module_candidates(candidate_module)
+                        )
 
                 candidates.extend(self._module_candidates(module))
 
@@ -116,15 +216,22 @@ class CodeImportResolutionService:
                     target.id if target is not None else None
                 )
 
-                if target is not None:
-                    resolved += 1
-                else:
-                    unresolved += 1
+                category = self._classify_import(
+                    module=import_item.module or "",
+                    relative_level=level,
+                    target=target,
+                    module_distributions=module_distributions,
+                    declared_distributions=declared_distributions,
+                )
+                counts[category] += 1
+
+                if target is None:
                     unresolved_details.append({
                         "source": source_file.path,
                         "module": import_item.module,
                         "relative_level": level,
                         "line": import_item.line_number,
+                        "classification": category,
                     })
 
         self.db.commit()
@@ -132,7 +239,12 @@ class CodeImportResolutionService:
         return {
             "repository_id": repository_id,
             "files_checked": len(files),
-            "imports_resolved": resolved,
-            "imports_unresolved": unresolved,
+            "imports_resolved": counts["internal"],
+            "imports_unresolved": (
+                counts["stdlib"]
+                + counts["third_party"]
+                + counts["unknown"]
+            ),
+            "classification_counts": counts,
             "unresolved_details": unresolved_details,
         }
