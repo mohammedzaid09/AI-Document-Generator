@@ -222,9 +222,11 @@ class GitHubService:
     ) -> dict:
         """Retrieve a text source file from a GitHub repository."""
 
-
         encoded_path = quote(path, safe="/")
-        url = f"{self.BASE_URL}/repos/{owner}/{repo}/contents/{encoded_path}"
+        url = (
+            f"{self.BASE_URL}/repos/"
+            f"{owner}/{repo}/contents/{encoded_path}"
+        )
 
         response = httpx.get(
             url,
@@ -252,12 +254,34 @@ class GitHubService:
                 f"Maximum allowed size is {max_size} bytes."
             )
 
+        encoding = result.get("encoding")
+
+        if encoding != "base64":
+            raise ValueError(
+                f"Unsupported or missing GitHub content encoding "
+                f"for {path}: {encoding}"
+            )
 
         encoded_content = result.get("content", "")
-        content = base64.b64decode(encoded_content).decode(
-            "utf-8",
-            errors="replace",
-        )
+
+        if not encoded_content.strip():
+            raise ValueError(
+                f"GitHub returned empty content for {path}."
+            )
+
+        # Remove whitespace and line breaks from Base64 content.
+        encoded_content = "".join(encoded_content.split())
+
+        try:
+            content = base64.b64decode(
+                encoded_content,
+                validate=True,
+            ).decode("utf-8")
+
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"Unable to decode source file {path}: {exc}"
+            ) from exc
 
         return {
             "path": path,
