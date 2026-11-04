@@ -5,9 +5,8 @@ from cryptography.fernet import InvalidToken
 
 from urllib.parse import quote
 from app.core.encryption import decrypt_github_token
-from app.repositories.github_account_repo import (
-    GitHubAccountRepository,
-)
+from app.repositories.github_account_repo import GitHubAccountRepository
+
 
 
 class GitHubService:
@@ -264,10 +263,14 @@ class GitHubService:
 
         encoded_content = result.get("content", "")
 
+        # Empty files are valid source files.
         if not encoded_content.strip():
-            raise ValueError(
-                f"GitHub returned empty content for {path}."
-            )
+            return {
+                "path": path,
+                "sha": result.get("sha"),
+                "size": size,
+                "content": "",
+            }
 
         # Remove whitespace and line breaks from Base64 content.
         encoded_content = "".join(encoded_content.split())
