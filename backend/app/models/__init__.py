@@ -7,6 +7,7 @@ from app.models.github_account import GitHubAccount
 from app.models.code_file import CodeFile
 from app.models.code_entity import CodeEntity
 from app.models.code_import import CodeImport
+from app.models.generated_document import GeneratedDocument
 
 __all__ = [
     "Base",
@@ -18,4 +19,5 @@ __all__ = [
     "CodeFile",
     "CodeEntity",
     "CodeImport",
+    "GeneratedDocument",
 ]
