@@ -8,6 +8,7 @@ from app.models.code_file import CodeFile
 from app.models.code_entity import CodeEntity
 from app.models.code_import import CodeImport
 from app.models.generated_document import GeneratedDocument
+from app.models.ai_usage import AIUsage
 
 __all__ = [
     "Base",
@@ -20,4 +21,5 @@ __all__ = [
     "CodeEntity",
     "CodeImport",
     "GeneratedDocument",
+    "AIUsage",
 ]
