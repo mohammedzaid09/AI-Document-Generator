@@ -53,3 +53,10 @@ class GeneratedDocument(Base):
     )
 
     repository = relationship("Repository")
+
+    sections = relationship(
+        "DocumentSection",
+        back_populates="document",
+        cascade="all, delete-orphan",
+        order_by="DocumentSection.order_index",
+    )

@@ -7,6 +7,9 @@ from app.core.config import (
     AI_MAX_OUTPUT_TOKENS,
 )
 
+class GeminiRequestError(RuntimeError):
+    """Raised when the Gemini API request itself fails."""
+
 class GeminiProvider:
     def __init__(self):
         if not GEMINI_API_KEY:
@@ -22,19 +25,31 @@ class GeminiProvider:
         self.model = GEMINI_MODEL
 
 
+   
+    
     def generate(self, prompt: str) -> dict:
         if not prompt.strip():
             raise ValueError("Prompt cannot be empty.")
 
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=AI_MAX_OUTPUT_TOKENS,
-                temperature=0.2,
-            ),
-        )
+        # Step 1: Send exactly one Gemini API request.
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=AI_MAX_OUTPUT_TOKENS,
+                    temperature=0.2,
+                ),
+            )
+        except Exception as exc:
+            print(
+                f"Gemini API error: {type(exc).__name__}: {exc}"
+            )
+            raise GeminiRequestError(
+                "Gemini API request failed."
+            ) from exc
 
+        # Step 2: Read response usage metadata.
         usage = response.usage_metadata
 
         if usage is None:
@@ -54,15 +69,11 @@ class GeminiProvider:
             tool_tokens,
         )
 
-        if any(
-            count is None or count < 0
-            for count in counts
-        ):
+        if any(count is None or count < 0 for count in counts):
             raise RuntimeError(
                 "Gemini returned missing or invalid token counts."
             )
 
-        # Count candidate output and thinking tokens.
         output_tokens = candidate_tokens + thoughts_tokens
 
         if output_tokens > AI_MAX_OUTPUT_TOKENS:
@@ -72,10 +83,28 @@ class GeminiProvider:
 
         total_tokens = input_tokens + output_tokens
 
+        # Step 3: Inspect Gemini's finish reason.
+        candidates = response.candidates or []
+
+        finish_reason = (
+            candidates[0].finish_reason
+            if candidates else None
+        )
+
+        finish_reason_name = (
+            getattr(finish_reason, "name", None)
+            or str(finish_reason or "UNKNOWN")
+        )
+
+        # Conservatively accept only a normal STOP as complete.
+        is_complete = finish_reason_name.upper().rsplit(".", 1)[-1] == "STOP"
+        # Step 4: Return content and usage, even when truncated.
         return {
             "content": response.text or "",
             "model": self.model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
+            "finish_reason": finish_reason_name,
+            "is_complete": is_complete,
         }

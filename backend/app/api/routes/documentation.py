@@ -87,6 +87,26 @@ def get_document(
             detail=str(exc),
         ) from exc
 
+@router.get("/documents/{document_id}/sections")
+def get_document_sections(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    service = DocumentationGenerationService(db)
+
+    try:
+        return service.get_document_sections(
+            user_id=current_user.id,
+            document_id=document_id,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
 @router.delete("/documents/{document_id}")
 def delete_document(
     document_id: int,
