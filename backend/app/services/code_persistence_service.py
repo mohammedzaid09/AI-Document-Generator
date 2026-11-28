@@ -125,3 +125,45 @@ class CodePersistenceService:
             "imports_saved": imports_saved,
             "files_failed": files_failed,
         }
+
+
+    def delete_files(self, repository_id: int, paths: list[str]) -> int:
+        """Delete removed files and clear references to them."""
+
+        if not paths:
+            return 0
+
+        try:
+            files = self.db.scalars(
+                select(CodeFile).where(
+                    CodeFile.repository_id == repository_id,
+                    CodeFile.path.in_(paths),
+                )
+            ).all()
+
+            if not files:
+                return 0
+
+            file_ids = [code_file.id for code_file in files]
+
+            # Clear references from imports in other files.
+            referencing_imports = self.db.scalars(
+                select(CodeImport).where(
+                    CodeImport.resolved_code_file_id.in_(file_ids)
+                )
+            ).all()
+
+            for import_item in referencing_imports:
+                import_item.resolved_code_file_id = None
+
+            # Delete the files and their associated analysis.
+            for code_file in files:
+                self.db.delete(code_file)
+
+            self.db.commit()
+
+            return len(files)
+
+        except Exception:
+            self.db.rollback()
+            raise

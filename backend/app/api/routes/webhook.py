@@ -1,13 +1,19 @@
+
 import json
 import hashlib
 import hmac
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Query
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import GITHUB_WEBHOOK_SECRET
 from app.core.database import get_db
 from app.repositories.repo_repository import RepositoryRepository
+from app.repositories.webhook_event_repository import WebhookEventRepository
+from app.core.dependencies import get_current_user
+from app.models.user import User
+from app.services.webhook_processing_service import WebhookProcessingService
 
 router = APIRouter(
     prefix="/api/webhooks",
@@ -36,6 +42,7 @@ async def github_webhook(
     request: Request,
     x_hub_signature_256: str | None = Header(default=None),
     x_github_event: str | None = Header(default=None),
+    x_github_delivery: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
     payload = await request.body()
@@ -55,13 +62,33 @@ async def github_webhook(
             "event": x_github_event or "unknown",
         }
 
+    if not x_github_delivery:
+        raise HTTPException(
+            status_code=400,
+            detail="GitHub delivery ID is missing",
+        )
+
     try:
-        data = await request.json()
+        data = json.loads(payload)
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(
             status_code=400,
             detail="Invalid JSON payload",
         ) from None
+
+    event_repository = WebhookEventRepository(db)
+
+    # Prevent duplicate delivery processing.
+    existing_event = event_repository.get_by_delivery_id(
+        x_github_delivery
+    )
+
+    if existing_event:
+        return {
+            "status": existing_event.status,
+            "event_id": existing_event.id,
+            "duplicate": True,
+        }
 
     github_data = data.get("repository") or {}
     head_commit = data.get("head_commit") or {}
@@ -75,6 +102,7 @@ async def github_webhook(
         )
 
     repository_repository = RepositoryRepository(db)
+
     stored_repository = repository_repository.get_by_github_id(
         github_repo_id
     )
@@ -86,6 +114,7 @@ async def github_webhook(
         )
 
     commits = data.get("commits") or []
+
     added = set()
     modified = set()
     removed = set()
@@ -98,25 +127,66 @@ async def github_webhook(
     added -= modified | removed
     modified -= removed
 
-    result = {
-        "event": "push",
-        "repository": stored_repository.full_name,
-        "repository_id": stored_repository.id,
-        "github_repo_id": stored_repository.github_repo_id,
-        "project_id": stored_repository.project_id,
-        "branch": data.get("ref", "").removeprefix("refs/heads/"),
-        "before": data.get("before"),
-        "after": data.get("after"),
-        "commit": head_commit.get("id"),
-        "message": head_commit.get("message"),
-        "changed_files": {
-            "added": sorted(added),
-            "modified": sorted(modified),
-            "removed": sorted(removed),
-        },
+    changed_files = {
+        "added": sorted(added),
+        "modified": sorted(modified),
+        "removed": sorted(removed),
     }
 
-    print("Processed GitHub push event:")
-    print(result)
+    branch = data.get("ref", "").removeprefix("refs/heads/")
 
-    return result
+    try:
+        event = event_repository.create(
+            repository_id=stored_repository.id,
+            delivery_id=x_github_delivery,
+            event_type="push",
+            branch=branch,
+            before_commit=data.get("before"),
+            after_commit=data.get("after"),
+            changed_files=changed_files,
+            commit_message=head_commit.get("message"),
+        )
+    except IntegrityError:
+        # Another request may have saved the same delivery concurrently.
+        db.rollback()
+
+        existing_event = event_repository.get_by_delivery_id(
+            x_github_delivery
+        )
+
+        if existing_event:
+            return {
+                "status": existing_event.status,
+                "event_id": existing_event.id,
+                "duplicate": True,
+            }
+
+        raise
+
+    return {
+        "status": event.status,
+        "event_id": event.id,
+        "duplicate": False,
+        "repository": stored_repository.full_name,
+        "repository_id": stored_repository.id,
+        "branch": event.branch,
+        "before": event.before_commit,
+        "after": event.after_commit,
+        "changed_files": event.changed_files,
+    }
+
+
+@router.post("/process-pending")
+def process_pending_webhooks(
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Process pending webhook events belonging to the authenticated user."""
+
+    service = WebhookProcessingService(db)
+
+    return service.process_pending_events(
+        owner_id=current_user.id,
+        limit=limit,
+    )
